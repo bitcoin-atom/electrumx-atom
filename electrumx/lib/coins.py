@@ -1621,8 +1621,12 @@ class BitcoinAtom(Coin):
     TX_COUNT = 295158744
     TX_COUNT_HEIGHT = 589197
     TX_PER_BLOCK = 10
-    RPC_PORT = 9136
+    RPC_PORT = 7332
     REORG_LIMIT = 5000
+    PEER_DEFAULT_PORTS = {'t': '50001', 's': '50002'}
+    PEERS = [
+        'electrum-bca.und.vc s t',
+    ]
 
     @classmethod
     def header_hash(cls, header):
@@ -1642,6 +1646,25 @@ class BitcoinAtom(Coin):
         '''Return the block header bytes'''
         deserializer = cls.DESERIALIZER(block)
         return deserializer.read_header(height, cls.BASIC_HEADER_SIZE)
+
+
+class BitcoinAtomTestnet(BitcoinAtom):
+    SHORTNAME = "tBCA"
+    NET = "testnet"
+    P2PKH_VERBYTE = bytes.fromhex("6f")
+    P2SH_VERBYTES = [bytes.fromhex("c4")]
+    WIF_BYTE = bytes.fromhex("ef")
+    GENESIS_HASH = ('000000000933ea01ad0ee984209779ba'
+                    'aec3ced90fa3f408719526f8d77f4943')
+    DESERIALIZER = lib_tx.DeserializerBitcoinAtomTestnet
+    TX_COUNT = 17128321
+    TX_COUNT_HEIGHT = 1334108
+    TX_PER_BLOCK = 3
+    RPC_PORT = 17332
+    PEER_DEFAULT_PORTS = {'t': '51001', 's': '51002'}
+    PEERS = [
+        'electrum-tbca.und.vc s t',
+    ]
 
 
 class Axe(Dash):

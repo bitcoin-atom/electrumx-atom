@@ -413,6 +413,10 @@ class DeserializerBitcoinAtom(DeserializerSegWit):
         return self._read_nbytes(header_len)
 
 
+class DeserializerBitcoinAtomTestnet(DeserializerBitcoinAtom):
+    FORK_BLOCK_HEIGHT = 1260000
+
+
 # Decred
 class TxInputDcr(namedtuple("TxInput", "prev_hash prev_idx tree sequence")):
     '''Class representing a Decred transaction input.'''
