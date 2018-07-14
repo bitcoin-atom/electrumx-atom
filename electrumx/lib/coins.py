@@ -1647,6 +1647,24 @@ class BitcoinAtom(Coin):
         deserializer = cls.DESERIALIZER(block)
         return deserializer.read_header(height, cls.BASIC_HEADER_SIZE)
 
+    @classmethod
+    def electrum_header(cls, header, height):
+        version, = struct.unpack('<I', header[:4])
+        timestamp, bits, nonce = struct.unpack('<III', header[68:80])
+        h = {
+            'block_height': height,
+            'version': version,
+            'prev_block_hash': hash_to_str(header[4:36]),
+            'merkle_root': hash_to_str(header[36:68]),
+            'timestamp': timestamp,
+            'bits': bits,
+            'nonce': nonce,
+        }
+        if len(header) == cls.HEADER_SIZE_POST_FORK:
+            flags, = struct.unpack('<I', header[-4:])
+            h['flags'] = flags
+        return h
+
 
 class BitcoinAtomTestnet(BitcoinAtom):
     SHORTNAME = "tBCA"
