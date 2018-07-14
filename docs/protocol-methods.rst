@@ -1,106 +1,9 @@
-Protocol Methods
-================
-
-blockchain.address.get_balance
-------------------------------
-
-Return the confirmed and unconfirmed balances of a bitcoin address.
-
-**Signature**
-
-  .. function:: blockchain.address.get_balance(address)
-  .. deprecated:: 1.2
-
-  * *address*
-
-    The address as a Base58 string.
-
-**Result**
-
-  See :func:`blockchain.scripthash.get_balance`.
-
-blockchain.address.get_history
-------------------------------
-
-Return the confirmed and unconfirmed history of a bitcoin address.
-
-**Signature**
-
-  .. function:: blockchain.address.get_history(address)
-  .. deprecated:: 1.2
-
-  * *address*
-
-    The address as a Base58 string.
-
-**Result**
-
-  As for :func:`blockchain.scripthash.get_history`.
-
-blockchain.address.get_mempool
-------------------------------
-
-Return the unconfirmed transactions of a bitcoin address.
-
-**Signature**
-
-  .. function:: blockchain.address.get_mempool(address)
-  .. deprecated:: 1.2
-
-  * *address*
-
-    The address as a Base58 string.
-
-**Result**
-
-  As for :func:`blockchain.scripthash.get_mempool`.
-
-blockchain.address.listunspent
-------------------------------
-
-Return an ordered list of UTXOs sent to a bitcoin address.
-
-**Signature**
-
-  .. function:: blockchain.address.listunspent(address)
-  .. deprecated:: 1.2
-
-  * *address*
-
-    The address as a Base58 string.
-
-**Result**
-
-  As for :func:`blockchain.scripthash.listunspent`.
-
-blockchain.address.subscribe
-----------------------------
-
-Subscribe to a bitcoin address.
-
-**Signature**
-
-  .. function:: blockchain.address.subscribe(address)
-  .. deprecated:: 1.2
-
-  *address*
-
-    The address as a Base58 string.
-
-**Result**
-
-  The :ref:`status <status>` of the address.
-
-**Notifications**
-
-  As this is a subcription, the client will receive a notification
-  when the :ref:`status <status>` of the address changes.  Its
-  signature is
-
-  .. function:: blockchain.address.subscribe(address, status)
+==================
+ Protocol Methods
+==================
 
 blockchain.block.get_header
----------------------------
+===========================
 
 Return the :ref:`deserialized header <deserialized header>` of the
 block at the given height.
@@ -108,6 +11,7 @@ block at the given height.
 **Signature**
 
   .. function:: blockchain.block.get_header(height)
+  .. deprecated:: 1.3
 
   *height*
 
@@ -132,7 +36,7 @@ block at the given height.
   }
 
 blockchain.block.get_chunk
---------------------------
+==========================
 
 Return a concatenated chunk of block headers from the main chain.
 Typically, a chunk consists of a fixed number of block headers over
@@ -161,8 +65,32 @@ bandwidth-intensive request.
     implied starting height will be returned; this may range from zero
     to the coin-specific chunk size.
 
+blockchain.block.header
+=======================
+
+Return the block header at the given height.
+
+**Signature**
+
+  .. function:: blockchain.block.header(height)
+  .. versionadded:: 1.3
+
+  *height*
+
+    The height of the block, an integer.
+
+**Result**
+
+  The raw block header as a hexadecimal string.
+
+**Example Result**
+
+::
+
+   "0100000085144a84488ea88d221c8bd6c059da090e88f8a2c99690ee55dbba4e00000000e11c48fecdd9e72510ca84f023370c9a38bf91ac5cae88019bee94d24528526344c36649ffff001d1d03e477"
+
 blockchain.block.headers
-------------------------
+========================
 
 Return a concatenated chunk of block headers from the main chain.
 
@@ -211,7 +139,7 @@ Return a concatenated chunk of block headers from the main chain.
   }
 
 blockchain.estimatefee
-----------------------
+======================
 
 Return the estimated transaction fee per kilobyte for a transaction to
 be confirmed within a certain number of blocks.
@@ -237,15 +165,17 @@ be confirmed within a certain number of blocks.
   0.00101079
 
 blockchain.headers.subscribe
-----------------------------
+============================
 
 Subscribe to receive block headers when a new block is found.
 
 **Signature**
 
-  .. function:: blockchain.headers.subscribe(raw=False)
+  .. function:: blockchain.headers.subscribe(raw=True)
   .. versionchanged:: 1.2
-     Optional *raw* parameter added.
+     Optional *raw* parameter added, defaulting to :const:`False`.
+  .. versionchanged:: 1.3
+     *raw* parameter deafults to :const:`True`.
 
   * *raw*
 
@@ -312,30 +242,8 @@ Subscribe to receive block headers when a new block is found.
   block headers to acquire a consistent view of the chain state.
 
 
-blockchain.numblocks.subscribe
-------------------------------
-
-Subscribe to receive the block height when a new block is found.
-
-**Signature**
-
-  .. function:: blockchain.numblocks.subscribe()
-
-  *Removed in version 1.1.*
-
-**Result**
-
-  The height of the current block, an integer.
-
-**Notifications**
-
-  As this is a subcription, the client will receive a notification
-  when a new block is found.  The notification's signature is:
-
-    .. function:: blockchain.numblocks.subscribe(height)
-
 blockchain.relayfee
--------------------
+===================
 
 Return the minimum fee a low-priority transaction must pay in order to
 be accepted to the daemon's memory pool.
@@ -360,7 +268,7 @@ be accepted to the daemon's memory pool.
    0.0
 
 blockchain.scripthash.get_balance
----------------------------------
+=================================
 
 Return the confirmed and unconfirmed balances of a :ref:`script hash
 <script hashes>`.
@@ -389,7 +297,7 @@ Return the confirmed and unconfirmed balances of a :ref:`script hash
   }
 
 blockchain.scripthash.get_history
----------------------------------
+=================================
 
 Return the confirmed and unconfirmed history of a :ref:`script hash
 <script hashes>`.
@@ -447,7 +355,7 @@ Return the confirmed and unconfirmed history of a :ref:`script hash
   ]
 
 blockchain.scripthash.get_mempool
----------------------------------
+=================================
 
 Return the unconfirmed transactions of a :ref:`script hash <script
 hashes>`.
@@ -491,7 +399,7 @@ hashes>`.
   ]
 
 blockchain.scripthash.listunspent
----------------------------------
+=================================
 
 Return an ordered list of UTXOs sent to a script hash.
 
@@ -550,7 +458,7 @@ Return an ordered list of UTXOs sent to a script hash.
   ]
 
 blockchain.scripthash.subscribe
--------------------------------
+===============================
 
 Subscribe to a script hash.
 
@@ -576,7 +484,7 @@ Subscribe to a script hash.
   .. function:: blockchain.scripthash.subscribe(scripthash, status)
 
 blockchain.transaction.broadcast
---------------------------------
+================================
 
 Broadcast a transaction to the network.
 
@@ -614,7 +522,7 @@ Protocol version 1.0 returning an error as the result:
   "258: txn-mempool-conflict"
 
 blockchain.transaction.get
---------------------------
+==========================
 
 Return a raw transaction.
 
@@ -690,7 +598,7 @@ When *verbose* is :const:`True`::
               "value": 0.1360904}]}
 
 blockchain.transaction.get_merkle
----------------------------------
+=================================
 
 Return the markle branch to a confirmed transaction given its hash
 and height.
@@ -749,34 +657,8 @@ and height.
     "pos": 710
   }
 
-blockchain.utxo.get_address
----------------------------
-
-Return the address paid to by a UTXO.
-
-**Signature**
-
-  .. function:: blockchain.utxo.get_address(tx_hash, index)
-
-  *Optional in version 1.0.  Removed in version 1.1.*
-
-  *tx_hash*
-
-    The transaction hash as a hexadecimal string.
-
-  *index*
-
-    The zero-based index of the UTXO in the transaction.
-
-**Result**
-
-  A Base58 address string, or :const:`null`.  If the transaction
-  doesn't exist, the index is out of range, or the output is not paid
-  to an address, :const:`null` must be returned.  If the output is
-  spent :const:`null` *may* be returned.
-
 mempool.get_fee_histogram
--------------------------
+=========================
 
 Return a histogram of the fee rates paid by transactions in the memory
 pool, weighted by transaction size.
@@ -807,7 +689,7 @@ pool, weighted by transaction size.
 
 
 server.add_peer
----------------
+===============
 
 A newly-started server uses this call to get itself into other servers'
 peers lists.  It sould not be used by wallet clients.
@@ -831,7 +713,7 @@ peers lists.  It sould not be used by wallet clients.
 
 
 server.banner
--------------
+=============
 
 Return a banner to be shown in the Electrum console.
 
@@ -851,7 +733,7 @@ Return a banner to be shown in the Electrum console.
 
 
 server.donation_address
------------------------
+=======================
 
 Return a server donation address.
 
@@ -871,7 +753,7 @@ Return a server donation address.
 
 
 server.features
----------------
+===============
 
 Return a list of features and services supported by the server.
 
@@ -955,7 +837,7 @@ Return a list of features and services supported by the server.
 
 
 server.peers.subscribe
-----------------------
+======================
 
 Return a list of peer servers.  Despite the name this is not a
 subscription and the server must send no notifications.
@@ -983,7 +865,7 @@ subscription and the server must send no notifications.
   missing then the server does not support that transport.
 
 server.ping
------------
+===========
 
 Ping the server to ensure it is responding, and to keep the session
 alive.  The server may disconnect clients that have sent no requests
@@ -999,7 +881,7 @@ for roughly 10 minutes.
   Returns :const:`null`.
 
 server.version
---------------
+==============
 
 Identify the client to the server and negotiate the protocol version.
 
@@ -1056,12 +938,19 @@ Identify the client to the server and negotiate the protocol version.
   ["ElectrumX 1.2.1", "1.2"]
   "ElectrumX 1.2.1"
 
+
+Masternode methods (Dash and compatible coins)
+==============================================
+
+
 masternode.announce.broadcast
------------------------------
+=============================
 
 Pass through the masternode announce message to be broadcast by the daemon.
 
-Whenever a masternode comes online or a client is syncing, they will send this message which describes the masternode entry and how to validate messages from it.
+Whenever a masternode comes online or a client is syncing, they will
+send this message which describes the masternode entry and how to
+validate messages from it.
 
 **Signature**
 
@@ -1073,18 +962,19 @@ Whenever a masternode comes online or a client is syncing, they will send this m
 
 **Result**
 
-  True if the message was broadcasted succesfully otherwise False.
+  :const:`True` if the message was broadcasted succesfully otherwise
+  :const:`False`.
 
-**Examples**::
+**Example**::
 
   masternode.announce.broadcast("012b825a65a24e2eb8edadbe27c4716dab993bf1046a66da77268ec87dbdd9dfc80100000000ffffffff00000000000000000000ffff22db1fec42d82103bfc9e296bcf4d63eced97b204df8f7b2b90131d452abd2b50909fa2ce6f66d752103bfc9e296bcf4d63eced97b204df8f7b2b90131d452abd2b50909fa2ce6f66d754120e95f74e9c242776df88a586bd52d2bd1838b600e5f3ce9d45d04865ff39a994632d617e810a4480ce24c882980746bc517a92be027d2ea70e4baece33a763608b1f91e5b00000000451201002b825a65a24e2eb8edadbe27c4716dab993bf1046a66da77268ec87dbdd9dfc80100000000ffffffff57280bc007121a0db854998f72e9a9fd2a690f38abffbd9aa94256330c020000b0f91e5b00000000412027c03b1531ee14db6160a62a0cc8b1a7e93ae122bbc6f2dffec721e0ae308b0e19e68523dd429450612bda3a616b56411b4e35d098e25b7c83f19fd2d8537e970000000000000000")
 
-**Example Results**::
+**Example Result**::
 
   True
 
 masternode.subscribe
---------------------
+====================
 
 Returns the status of masternode.
 
@@ -1096,26 +986,31 @@ Returns the status of masternode.
 
     The txId and the index of the collateral.
 
-    A masternode collateral is a transaction with a specific amount of coins, it's also known as a masternode identifier.
+    A masternode collateral is a transaction with a specific amount of
+    coins, it's also known as a masternode identifier.
 
-    i.e. for DASH the required amount is 1,000 DASH or for $PAC is 500,000 $PAC.
+    i.e. for DASH the required amount is 1,000 DASH or for $PAC is
+    500,000 $PAC.
 
 **Result**
 
-  As this is a subcription, the client will receive a notification when the masternode status changes.
+  As this is a subcription, the client will receive a notification
+  when the masternode status changes.
 
-  The status depends on the server the masternode is hosted, the internet connection, the offline time and even the collateral amount, so this subscription notice these changes to the user.
+  The status depends on the server the masternode is hosted, the
+  internet connection, the offline time and even the collateral
+  amount, so this subscription notice these changes to the user.
 
 **Example**::
 
   masternode.subscribe("8c59133e714797650cf69043d05e409bbf45670eed7c4e4a386e52c46f1b5e24-0")
 
-**Example Results**::
+**Example Result**::
 
   {'method': 'masternode.subscribe', u'jsonrpc': u'2.0', u'result': u'ENABLED', 'params': ['8c59133e714797650cf69043d05e409bbf45670eed7c4e4a386e52c46f1b5e24-0'], u'id': 19}
 
 masternode.list
----------------
+===============
 
 Returns the list of masternodes.
 
@@ -1131,12 +1026,12 @@ Returns the list of masternodes.
 
   An array with the masternodes information.
 
-**Examples**::
+**Example**::
 
   masternode.list("['PDFHmjKLvSGdnWgDJSJX49Rrh0SJtRANcE',
   'PDFHmjKLvSGdnWgDJSJX49Rrh0SJtRANcF']")
 
-**Example Results**::
+**Example Result**::
 
     [
       {

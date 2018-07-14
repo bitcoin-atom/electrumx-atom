@@ -11,14 +11,13 @@
 
 import array
 import asyncio
-import logging
 from struct import pack, unpack
 import time
 from functools import partial
 
 from electrumx.server.daemon import DaemonError
-from electrumx.lib.hash import hash_to_str, HASHX_LEN
-from electrumx.lib.util import chunks, formatted_time
+from electrumx.lib.hash import hash_to_hex_str, HASHX_LEN
+from electrumx.lib.util import chunks, formatted_time, class_logger
 import electrumx.server.db
 
 
@@ -26,8 +25,7 @@ class Prefetcher(object):
     '''Prefetches blocks (in the forward direction only).'''
 
     def __init__(self, bp):
-        self.logger = logging.getLogger(__name__)\
-            .getChild(self.__class__.__name__)
+        self.logger = class_logger(__name__, self.__class__.__name__)
         self.bp = bp
         self.caught_up = False
         # Access to fetched_height should be protected by the semaphore
@@ -288,7 +286,7 @@ class BlockProcessor(electrumx.server.db.DB):
 
         hashes = await self.reorg_hashes(count)
         # Reverse and convert to hex strings.
-        hashes = [hash_to_str(hash) for hash in reversed(hashes)]
+        hashes = [hash_to_hex_str(hash) for hash in reversed(hashes)]
         for hex_hashes in chunks(hashes, 50):
             blocks = await self.daemon.raw_blocks(hex_hashes)
             await self.controller.run_in_executor(self.backup_blocks, blocks)
@@ -313,7 +311,7 @@ class BlockProcessor(electrumx.server.db.DB):
             count = 1
             while start > 0:
                 hashes = self.fs_block_hashes(start, count)
-                hex_hashes = [hash_to_str(hash) for hash in hashes]
+                hex_hashes = [hash_to_hex_str(hash) for hash in hashes]
                 d_hex_hashes = await self.daemon.block_hex_hashes(start, count)
                 n = diff_pos(hex_hashes, d_hex_hashes)
                 if n > 0:
@@ -576,8 +574,9 @@ class BlockProcessor(electrumx.server.db.DB):
             header_hash = coin.header_hash(block.header)
             if header_hash != self.tip:
                 raise ChainError('backup block {} not tip {} at height {:,d}'
-                                 .format(hash_to_str(header_hash),
-                                         hash_to_str(self.tip), self.height))
+                                 .format(hash_to_hex_str(header_hash),
+                                         hash_to_hex_str(self.tip),
+                                         self.height))
             self.tip = coin.header_prevhash(block.header)
             self.backup_txs(block.transactions)
             self.height -= 1
@@ -720,7 +719,7 @@ class BlockProcessor(electrumx.server.db.DB):
                 return hashX + tx_num_packed + utxo_value_packed
 
         raise ChainError('UTXO {} / {:,d} not found in "h" table'
-                         .format(hash_to_str(tx_hash), tx_idx))
+                         .format(hash_to_hex_str(tx_hash), tx_idx))
 
     def flush_utxos(self, batch):
         '''Flush the cached DB writes and UTXO set to the batch.'''

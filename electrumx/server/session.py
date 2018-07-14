@@ -15,7 +15,7 @@ from functools import partial
 
 from aiorpcx import ServerSession, JSONRPCAutoDetect, RPCError
 
-from electrumx.lib.hash import sha256, hash_to_str
+from electrumx.lib.hash import sha256, hash_to_hex_str
 import electrumx.lib.util as util
 from electrumx.server.daemon import DaemonError
 
@@ -51,6 +51,7 @@ class SessionBase(ServerSession):
 
     def __init__(self, controller, kind):
         super().__init__(rpc_protocol=JSONRPCAutoDetect)
+        self.logger = util.class_logger(__name__, self.__class__.__name__)
         self.kind = kind  # 'RPC', 'TCP' etc.
         self.controller = controller
         self.bp = controller.bp
@@ -217,12 +218,16 @@ class ElectrumX(SessionBase):
             return {'hex': raw_header.hex(), 'height': height}
         return self.controller.electrum_header(height)
 
-    def headers_subscribe(self, raw=False):
+    def headers_subscribe(self, raw=True):
         '''Subscribe to get headers of new blocks.'''
         self.subscribe_headers = True
         self.subscribe_headers_raw = self.assert_boolean(raw)
         self.notified_height = self.height()
         return self.subscribe_headers_result(self.height())
+
+    def headers_subscribe_old(self, raw=False):
+        '''Subscribe to get headers of new blocks; raw defaults to False.'''
+        return self.headers_subscribe(raw)
 
     async def add_peer(self, features):
         '''Add a peer (but only if the peer resolves to the source).'''
@@ -243,7 +248,7 @@ class ElectrumX(SessionBase):
         history = await self.controller.get_history(hashX)
         mempool = await self.controller.mempool_transactions(hashX)
 
-        status = ''.join('{}:{:d}:'.format(hash_to_str(tx_hash), height)
+        status = ''.join('{}:{:d}:'.format(hash_to_hex_str(tx_hash), height)
                          for tx_hash, height in history)
         status += ''.join('{}:{:d}:'.format(hex_hash, -unconfirmed)
                           for hex_hash, tx_fee, unconfirmed in mempool)
@@ -283,6 +288,14 @@ class ElectrumX(SessionBase):
         scripthash: the SHA256 hash of the script to subscribe to'''
         hashX = self.controller.scripthash_to_hashX(scripthash)
         return await self.hashX_subscribe(hashX, scripthash)
+
+    def block_header(self, height):
+        '''Return a raw block header as a hexadecimal string.
+
+        height: the header's height'''
+        height = self.controller.non_negative_integer(height)
+        raw_header = self.controller.raw_header(height)
+        return raw_header.hex()
 
     def block_headers(self, start_height, count):
         '''Return count concatenated block headers as hex for the main chain;
@@ -422,15 +435,9 @@ class ElectrumX(SessionBase):
 
         controller = self.controller
         handlers = {
-            'blockchain.address.get_balance': controller.address_get_balance,
-            'blockchain.address.get_history': controller.address_get_history,
-            'blockchain.address.get_mempool': controller.address_get_mempool,
-            'blockchain.address.listunspent': controller.address_listunspent,
-            'blockchain.address.subscribe': self.address_subscribe,
             'blockchain.block.get_chunk': self.block_get_chunk,
             'blockchain.block.get_header': controller.block_get_header,
             'blockchain.estimatefee': controller.estimatefee,
-            'blockchain.headers.subscribe': self.headers_subscribe,
             'blockchain.relayfee': controller.relayfee,
             'blockchain.scripthash.get_balance':
             controller.scripthash_get_balance,
@@ -460,6 +467,25 @@ class ElectrumX(SessionBase):
                 controller.mempool_get_fee_histogram,
                 'blockchain.block.headers': self.block_headers,
                 'server.ping': self.ping,
+            })
+
+        if ptuple >= (1, 3):
+            handlers.update({
+                'blockchain.block.header': self.block_header,
+                'blockchain.headers.subscribe': self.headers_subscribe,
+            })
+        else:
+            handlers.update({
+                'blockchain.headers.subscribe': self.headers_subscribe_old,
+                'blockchain.address.get_balance':
+                controller.address_get_balance,
+                'blockchain.address.get_history':
+                controller.address_get_history,
+                'blockchain.address.get_mempool':
+                controller.address_get_mempool,
+                'blockchain.address.listunspent':
+                controller.address_listunspent,
+                'blockchain.address.subscribe': self.address_subscribe,
             })
 
         self.electrumx_handlers = handlers
