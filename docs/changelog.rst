@@ -7,6 +7,13 @@
    and memory consumption whilst serving clients.  Those problems
    should not occur with Python 3.7.
 
+Version 1.5.2
+=============
+
+* package renamed from elctrumX-kyuupichan to electrumX
+* split merkle logic out into lib/merkle.py
+* fix `#523`_ for daemons based on older releases of core
+
 Version 1.5.1
 =============
 
