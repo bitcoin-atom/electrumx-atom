@@ -20,9 +20,9 @@ from functools import partial
 import pylru
 
 from aiorpcx import RPCError, TaskSet, _version as aiorpcx_version
-from electrumx.lib.hash import double_sha256, hash_to_hex_str, hex_str_to_hash
+import electrumx
+from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash
 from electrumx.lib.hash import HASHX_LEN
-from electrumx.lib.merkle import Merkle
 from electrumx.lib.peer import Peer
 from electrumx.lib.server_base import ServerBase
 import electrumx.lib.util as util
@@ -30,11 +30,9 @@ from electrumx.server.daemon import DaemonError
 from electrumx.server.mempool import MemPool
 from electrumx.server.peers import PeerManager
 from electrumx.server.session import LocalRPC, BAD_REQUEST, DAEMON_ERROR
-from electrumx.server.version import VERSION
 
 
 version_string = util.version_string
-merkle = Merkle()
 
 
 class SessionGroup(object):
@@ -54,9 +52,8 @@ class Controller(ServerBase):
 
     CATCHING_UP, LISTENING, PAUSED, SHUTTING_DOWN = range(4)
     PROTOCOL_MIN = '1.1'
-    PROTOCOL_MAX = '1.3'
+    PROTOCOL_MAX = '1.4'
     AIORPCX_MIN = (0, 5, 6)
-    VERSION = VERSION
 
     def __init__(self, env):
         '''Initialize everything that doesn't require the event loop.'''
@@ -65,7 +62,7 @@ class Controller(ServerBase):
             raise RuntimeError('ElectrumX requires aiorpcX >= '
                                f'{version_string(self.AIORPCX_MIN)}')
 
-        self.logger.info(f'software version: {self.VERSION}')
+        self.logger.info(f'software version: {electrumx.version}')
         self.logger.info(f'aiorpcX version: {version_string(aiorpcx_version)}')
         self.logger.info(f'supported protocol versions: '
                          f'{self.PROTOCOL_MIN}-{self.PROTOCOL_MAX}')
@@ -109,17 +106,12 @@ class Controller(ServerBase):
         # Event triggered when electrumx is listening for incoming requests.
         self.server_listening = asyncio.Event()
 
-    @classmethod
-    def short_version(cls):
-        '''Return e.g. "1.2" for ElectrumX 1.2'''
-        return cls.VERSION.split()[-1]
-
     def server_features(self):
         '''Return the server features dictionary.'''
         return {
             'hosts': self.env.hosts_dict(),
             'pruning': None,
-            'server_version': self.VERSION,
+            'server_version': electrumx.version,
             'protocol_min': self.PROTOCOL_MIN,
             'protocol_max': self.PROTOCOL_MAX,
             'genesis_hash': self.coin.GENESIS_HASH,
@@ -128,14 +120,19 @@ class Controller(ServerBase):
 
     def server_version_args(self):
         '''The arguments to a server.version RPC call to a peer.'''
-        return [self.VERSION, [self.PROTOCOL_MIN, self.PROTOCOL_MAX]]
+        return [electrumx.version, [self.PROTOCOL_MIN, self.PROTOCOL_MAX]]
 
-    def protocol_tuple(self, client_protocol_str):
-        '''Given a client's protocol version string, return the negotiated
-        protocol version tuple, or None if unsupported.
+    def protocol_tuple(self, request):
+        '''Given a client's protocol version request, return the negotiated
+        protocol tuple.  If the request is unsupported return None.
         '''
-        return util.protocol_version(client_protocol_str,
-                                     self.PROTOCOL_MIN, self.PROTOCOL_MAX)
+        ptuple, client_min = util.protocol_version(request, self.PROTOCOL_MIN,
+                                                   self.PROTOCOL_MAX)
+        if not ptuple and client_min > util.protocol_tuple(self.PROTOCOL_MIN):
+            version = version_string(client_min)
+            self.logger.info(f'client requested future protocol version '
+                             f'{version} - is your software out of date?')
+        return ptuple
 
     async def start_servers(self):
         '''Start the RPC server and schedule the external servers to be
@@ -235,7 +232,6 @@ class Controller(ServerBase):
         '''Wait for the block processor to catch up, and for the mempool to
         synchronize, then kick off server background processes.'''
         await self.bp.caught_up_event.wait()
-        self.logger.info('block processor has caught up')
         self.create_task(self.mempool.main_loop())
         await self.mempool.synchronized_event.wait()
         self.create_task(self.peer_mgr.main_loop())
@@ -411,7 +407,7 @@ class Controller(ServerBase):
         '''A one-line summary of server state.'''
         group_map = self._group_map()
         return {
-            'version': VERSION,
+            'version': electrumx.version,
             'daemon': self.daemon.logged_url(),
             'daemon_height': self.daemon.cached_height(),
             'db_height': self.bp.db_height,
@@ -863,7 +859,7 @@ class Controller(ServerBase):
                            f'block {block_hash} at height {height:,d}')
 
         hashes = [hex_str_to_hash(hash) for hash in tx_hashes]
-        branch, root = merkle.branch_and_root(hashes, pos)
+        branch, root = self.bp.merkle.branch_and_root(hashes, pos)
         branch = [hash_to_hex_str(hash) for hash in branch]
 
         return {"block_height": height, "merkle": branch, "pos": pos}
