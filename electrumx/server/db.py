@@ -192,7 +192,7 @@ class DB(object):
         offset = prior_tx_count * 32
         self.hashes_file.write(offset, hashes)
 
-    def read_headers(self, start_height, count):
+    def read_headers(self, start_height, count, ext_headers = False):
         '''Requires start_height >= 0, count >= 0.  Reads as many headers as
         are available starting at start_height up to count.  This
         would be zero if start_height is beyond self.db_height, for
@@ -209,8 +209,22 @@ class DB(object):
         if disk_count:
             offset = self.header_offset(start_height)
             size = self.header_offset(start_height + disk_count) - offset
-            return self.headers_file.read(offset, size), disk_count
+            headers = self.headers_file.read(offset, size) # read ext headers from db
+
+            if not ext_headers:
+                headers = self.slice_headers(headers, disk_count) # slice ext headers to basic ones
+
+            return headers, disk_count
         return b'', 0
+
+    def slice_headers(self, binary, count): # extended to basic
+        if count * self.coin.HEADER_SIZE_POST_FORK == len(binary):
+            sliced = []
+            for n in range(count):
+                head = n * self.coin.HEADER_SIZE_POST_FORK
+                sliced.append(binary[head:head + self.coin.BASIC_HEADER_SIZE])
+            return b''.join(sliced)
+        return binary
 
     def fs_tx_hash(self, tx_num):
         '''Return a par (tx_hash, tx_height) for the given tx number.
@@ -224,7 +238,7 @@ class DB(object):
         return tx_hash, tx_height
 
     def fs_block_hashes(self, height, count):
-        headers_concat, headers_count = self.read_headers(height, count)
+        headers_concat, headers_count = self.read_headers(height, count, True) # read extended headers (84 byte with 'flags' field)
         if headers_count != count:
             raise self.DBError('only got {:,d} headers starting at {:,d}, not '
                                '{:,d}'.format(headers_count, height, count))
