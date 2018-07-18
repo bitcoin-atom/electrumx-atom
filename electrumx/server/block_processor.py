@@ -146,15 +146,15 @@ class BlockProcessor(electrumx.server.db.DB):
     Coordinate backing up in case of chain reorganisations.
     '''
 
-    def __init__(self, env, controller, daemon):
+    def __init__(self, env, tasks, daemon):
         super().__init__(env)
 
         # An incomplete compaction needs to be cancelled otherwise
         # restarting it will corrupt the history
         self.history.cancel_compaction()
 
+        self.tasks = tasks
         self.daemon = daemon
-        self.controller = controller
 
         # These are our state as we move ahead of DB state
         self.fs_height = self.db_height
@@ -172,6 +172,7 @@ class BlockProcessor(electrumx.server.db.DB):
         self.last_flush = time.time()
         self.last_flush_tx_count = self.tx_count
         self.touched = set()
+        self.callbacks = []
 
         # Header merkle cache
         self.merkle = Merkle()
@@ -204,9 +205,18 @@ class BlockProcessor(electrumx.server.db.DB):
         '''Called by the prefetcher when it first catches up.'''
         self.add_task(self.first_caught_up)
 
+    def add_new_block_callback(self, callback):
+        '''Add a function called when a new block is found.
+
+        If several blocks are processed simultaneously, only called
+        once.  The callback is passed a set of hashXs touched by the
+        block(s), which is cleared on return.
+        '''
+        self.callbacks.append(callback)
+
     async def main_loop(self):
         '''Main loop for block processing.'''
-        self.controller.create_task(self.prefetcher.main_loop())
+        self.tasks.create_task(self.prefetcher.main_loop())
         await self.prefetcher.reset_height()
 
         while True:
@@ -226,7 +236,7 @@ class BlockProcessor(electrumx.server.db.DB):
         '''Called when first caught up to daemon after starting.'''
         # Flush everything with updated first_sync->False state.
         self.first_sync = False
-        await self.controller.run_in_executor(self.flush, True)
+        await self.tasks.run_in_thread(self.flush, True)
         if self.utxo_db.for_sync:
             self.logger.info(f'{electrumx.version} synced to '
                              f'height {self.height:,d}')
@@ -261,13 +271,14 @@ class BlockProcessor(electrumx.server.db.DB):
 
         if hprevs == chain:
             start = time.time()
-            await self.controller.run_in_executor(self.advance_blocks, blocks)
+            await self.tasks.run_in_thread(self.advance_blocks, blocks)
             if not self.first_sync:
                 s = '' if len(blocks) == 1 else 's'
                 self.logger.info('processed {:,d} block{} in {:.1f}s'
                                  .format(len(blocks), s,
                                          time.time() - start))
-                self.controller.mempool.on_new_block(self.touched)
+                for callback in self.callbacks:
+                    callback(self.touched)
             self.touched.clear()
         elif hprevs[0] != chain[0]:
             await self.reorg_chain()
@@ -299,23 +310,37 @@ class BlockProcessor(electrumx.server.db.DB):
         if count is None:
             self.logger.info('chain reorg detected')
         else:
-            self.logger.info('faking a reorg of {:,d} blocks'.format(count))
-        await self.controller.run_in_executor(self.flush, True)
+            self.logger.info(f'faking a reorg of {count:,d} blocks')
+        await self.tasks.run_in_thread(self.flush, True)
 
-        hashes = await self.reorg_hashes(count)
+        async def get_raw_blocks(last_height, hex_hashes):
+            heights = range(last_height, last_height - len(hex_hashes), -1)
+            try:
+                blocks = [self.read_raw_block(height) for height in heights]
+                self.logger.info(f'read {len(blocks)} blocks from disk')
+                return blocks
+            except Exception:
+                return await self.daemon.raw_blocks(hex_hashes)
+
+        start, hashes = await self.reorg_hashes(count)
         # Reverse and convert to hex strings.
         hashes = [hash_to_hex_str(hash) for hash in reversed(hashes)]
+        last = start + count - 1
         for hex_hashes in chunks(hashes, 50):
-            blocks = await self.daemon.raw_blocks(hex_hashes)
-            await self.controller.run_in_executor(self.backup_blocks, blocks)
+            raw_blocks = await get_raw_blocks(last, hex_hashes)
+            await self.tasks.run_in_thread(self.backup_blocks, raw_blocks)
+            last -= len(raw_blocks)
         # Truncate header_mc: header count is 1 more than the height
         self.header_mc.truncate(self.height + 1)
         await self.prefetcher.reset_height()
 
     async def reorg_hashes(self, count):
-        '''Return the list of hashes to back up beacuse of a reorg.
+        '''Return a pair (start, hashes) of blocks to back up during a
+        reorg.
 
-        The hashes are returned in order of increasing height.'''
+        The hashes are returned in order of increasing height.  Start
+        is the height of the first hash.
+        '''
 
         def diff_pos(hashes1, hashes2):
             '''Returns the index of the first difference in the hash lists.
@@ -349,7 +374,7 @@ class BlockProcessor(electrumx.server.db.DB):
                          'heights {:,d}-{:,d}'
                          .format(count, s, start, start + count - 1))
 
-        return self.fs_block_hashes(start, count)
+        return start, self.fs_block_hashes(start, count)
 
     def flush_state(self, batch):
         '''Flush chain state to the batch.'''
@@ -516,6 +541,7 @@ class BlockProcessor(electrumx.server.db.DB):
             undo_info = self.advance_txs(block.transactions)
             if height >= min_height:
                 self.undo_infos.append((undo_info, height))
+                self.write_raw_block(block.raw, height)
 
         headers = [block.header for block in blocks]
         self.height = height

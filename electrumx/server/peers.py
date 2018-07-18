@@ -51,8 +51,7 @@ class PeerSession(ClientSession):
                 self.peer.ip_addr = address[0]
 
         # Send server.version first
-        controller = self.peer_mgr.controller
-        self.send_request('server.version', controller.server_version_args(),
+        self.send_request('server.version', self.peer_mgr.server_version_args,
                           self.on_version, timeout=self.timeout)
 
     def connection_lost(self, exc):
@@ -142,8 +141,7 @@ class PeerSession(ClientSession):
             return
 
         result = request.result()
-        controller = self.peer_mgr.controller
-        our_height = controller.bp.db_height
+        our_height = self.peer_mgr.chain_state.db_height()
         if self.ptuple < (1, 3):
             their_height = result.get('block_height')
         else:
@@ -157,12 +155,31 @@ class PeerSession(ClientSession):
             return
         # Check prior header too in case of hard fork.
         check_height = min(our_height, their_height)
-        expected_header = controller.electrum_header(check_height)
-        self.send_request('blockchain.block.get_header', [check_height],
-                          partial(self.on_header, expected_header),
-                          timeout=self.timeout)
+        raw_header = self.peer_mgr.chain_state.raw_header(check_height)
+        if self.ptuple >= (1, 4):
+            self.send_request('blockchain.block.header', [check_height],
+                              partial(self.on_header, raw_header.hex()),
+                              timeout=self.timeout)
+        else:
+            expected_header = self.peer_mgr.env.coin.electrum_header(
+                raw_header, check_height)
+            self.send_request('blockchain.block.get_header', [check_height],
+                              partial(self.on_legacy_header, expected_header),
+                              timeout=self.timeout)
 
-    def on_header(self, expected_header, request):
+    def on_header(self, ours, request):
+        '''Handle the response to blockchain.block.get_header message.
+        Compare hashes of prior header in attempt to determine if forked.'''
+        if not self.is_good(request, str):
+            return
+
+        theirs = request.result()
+        if ours == theirs:
+            self.maybe_close()
+        else:
+            self.bad('our header {} and theirs {} differ'.format(ours, theirs))
+
+    def on_legacy_header(self, expected_header, request):
         '''Handle the response to blockchain.block.get_header message.
         Compare hashes of prior header in attempt to determine if forked.'''
         if not self.is_good(request, dict):
@@ -223,17 +240,20 @@ class PeerManager(object):
     Attempts to maintain a connection with up to 8 peers.
     Issues a 'peers.subscribe' RPC to them and tells them our data.
     '''
-    def __init__(self, env, controller):
+    def __init__(self, env, tasks, chain_state):
         self.logger = class_logger(__name__, self.__class__.__name__)
         # Initialise the Peer class
         Peer.DEFAULT_PORTS = env.coin.PEER_DEFAULT_PORTS
         self.env = env
-        self.controller = controller
-        self.loop = controller.loop
+        self.tasks = tasks
+        self.chain_state = chain_state
+        self.loop = tasks.loop
 
         # Our clearnet and Tor Peers, if any
-        self.myselves = [Peer(ident.host, controller.server_features(), 'env')
+        sclass = env.coin.SESSIONCLS
+        self.myselves = [Peer(ident.host, sclass.server_features(env), 'env')
                          for ident in env.identities]
+        self.server_version_args = sclass.server_version_args()
         self.retry_event = asyncio.Event()
         # Peers have one entry per hostname.  Once connected, the
         # ip_addr property is either None, an onion peer, or the
@@ -552,7 +572,7 @@ class PeerManager(object):
 
         session = PeerSession(peer, self, kind, peer.host, port, **kwargs)
         callback = partial(self.on_connected, peer, port_pairs)
-        self.controller.create_task(session.create_connection(), callback)
+        self.tasks.create_task(session.create_connection(), callback)
 
     def on_connected(self, peer, port_pairs, task):
         '''Called when a connection attempt succeeds or fails.
