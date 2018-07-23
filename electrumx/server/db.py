@@ -206,11 +206,11 @@ class DB(object):
         return b'', 0
 
     def slice_headers(self, binary, count): # extended to basic
-        if count * self.coin.HEADER_SIZE_POST_FORK == len(binary):
+        if count * 84 == len(binary):
             sliced = []
             for n in range(count):
-                head = n * self.coin.HEADER_SIZE_POST_FORK
-                sliced.append(binary[head:head + self.coin.BASIC_HEADER_SIZE])
+                head = n * 84
+                sliced.append(binary[head:head + 80])
             return b''.join(sliced)
         return binary
 
