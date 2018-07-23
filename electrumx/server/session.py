@@ -97,12 +97,15 @@ class SessionManager(object):
 
     CATCHING_UP, LISTENING, PAUSED, SHUTTING_DOWN = range(4)
 
-    def __init__(self, env, tasks, chain_state, peer_mgr):
+    def __init__(self, env, tasks, chain_state, mempool, peer_mgr,
+                 notifications, shutdown_event):
         env.max_send = max(350000, env.max_send)
         self.env = env
         self.tasks = tasks
         self.chain_state = chain_state
+        self.mempool = mempool
         self.peer_mgr = peer_mgr
+        self.shutdown_event = shutdown_event
         self.logger = util.class_logger(__name__, self.__class__.__name__)
         self.servers = {}
         self.sessions = set()
@@ -122,8 +125,9 @@ class SessionManager(object):
             self.mn_cache = []
         # Event triggered when electrumx is listening for incoming requests.
         self.server_listening = asyncio.Event()
-        # FIXME
-        chain_state.mempool.notify_sessions = self.notify_sessions
+        # Tell sessions about subscription changes
+        notifications.add_callback(self._notify_sessions)
+
         # Set up the RPC request handlers
         cmds = ('add_peer daemon_url disconnect getinfo groups log peers '
                 'reorg sessions stop'.split())
@@ -136,7 +140,7 @@ class SessionManager(object):
         else:
             protocol_class = self.env.coin.SESSIONCLS
         protocol_factory = partial(protocol_class, self, self.chain_state,
-                                   self.peer_mgr, kind)
+                                   self.mempool, self.peer_mgr, kind)
         server = loop.create_server(protocol_factory, *args, **kw_args)
 
         host, port = args[:2]
@@ -174,6 +178,30 @@ class SessionManager(object):
             server = self.servers.pop(kind, None)
             if server:
                 server.close()
+
+    async def _housekeeping(self):
+        '''Regular housekeeping checks.'''
+        n = 0
+        while True:
+            n += 1
+            await asyncio.sleep(15)
+            if n % 10 == 0:
+                self._clear_stale_sessions()
+
+            # Start listening for incoming connections if paused and
+            # session count has fallen
+            if (self.state == self.PAUSED and
+                    len(self.sessions) <= self.low_watermark):
+                await self._start_external_servers()
+
+            # Periodically log sessions
+            if self.env.log_sessions and time.time() > self.next_log_sessions:
+                if self.next_log_sessions:
+                    data = self._session_data(for_log=True)
+                    for line in text.sessions_lines(data):
+                        self.logger.info(line)
+                    self.logger.info(json.dumps(self._get_info()))
+                self.next_log_sessions = time.time() + self.env.log_sessions
 
     def _group_map(self):
         group_map = defaultdict(list)
@@ -337,7 +365,7 @@ class SessionManager(object):
 
     def rpc_stop(self):
         '''Shut down the server cleanly.'''
-        self.chain_state.shutdown()
+        self.shutdown_event.set()
         return 'stopping'
 
     def rpc_getinfo(self):
@@ -368,7 +396,13 @@ class SessionManager(object):
 
     # --- External Interface
 
-    async def start_serving(self):
+    def start_rpc_server(self):
+        '''Start the RPC server if enabled.'''
+        if self.env.rpc_port is not None:
+            self.tasks.create_task(self._start_server(
+                'RPC', self.env.cs_host(for_rpc=True), self.env.rpc_port))
+
+    def start_serving(self):
         '''Start TCP and SSL servers.'''
         self.logger.info('max session count: {:,d}'.format(self.max_sessions))
         self.logger.info('session timeout: {:,d} seconds'
@@ -384,12 +418,8 @@ class SessionManager(object):
         if self.env.drop_client is not None:
             self.logger.info('drop clients matching: {}'
                              .format(self.env.drop_client.pattern))
-        await self._start_external_servers()
-
-    async def start_rpc_server(self):
-        if self.env.rpc_port is not None:
-            await self._start_server('RPC', self.env.cs_host(for_rpc=True),
-                                     self.env.rpc_port)
+        self.tasks.create_task(self._start_external_servers())
+        self.tasks.create_task(self._housekeeping())
 
     async def shutdown(self):
         '''Close servers and sessions.'''
@@ -404,42 +434,11 @@ class SessionManager(object):
         '''The number of connections that we've sent something to.'''
         return len(self.sessions)
 
-    def notify_sessions(self, touched):
+    async def _notify_sessions(self, height, touched):
         '''Notify sessions about height changes and touched addresses.'''
-        self.chain_state.invalidate_history_cache(touched)
-        # Height notifications are synchronous.  Those sessions with
-        # touched addresses are scheduled for asynchronous completion
-        height = self.chain_state.db_height()
+        create_task = self.tasks.create_task
         for session in self.sessions:
-            if isinstance(session, LocalRPC):
-                continue
-            session_touched = session.notify(height, touched)
-            if session_touched is not None:
-                self.tasks.create_task(session.notify_async(session_touched))
-
-    async def housekeeping(self):
-        '''Regular housekeeping checks.'''
-        n = 0
-        while True:
-            n += 1
-            await asyncio.sleep(15)
-            if n % 10 == 0:
-                self._clear_stale_sessions()
-
-            # Start listening for incoming connections if paused and
-            # session count has fallen
-            if (self.state == self.PAUSED and
-                    len(self.sessions) <= self.low_watermark):
-                await self._start_external_servers()
-
-            # Periodically log sessions
-            if self.env.log_sessions and time.time() > self.next_log_sessions:
-                if self.next_log_sessions:
-                    data = self._session_data(for_log=True)
-                    for line in text.sessions_lines(data):
-                        self.logger.info(line)
-                    self.logger.info(json.dumps(self._get_info()))
-                self.next_log_sessions = time.time() + self.env.log_sessions
+            create_task(session.notify(height, touched))
 
     def add_session(self, session):
         self.sessions.add(session)
@@ -478,14 +477,15 @@ class SessionBase(ServerSession):
     MAX_CHUNK_SIZE = 2016
     session_counter = itertools.count()
 
-    def __init__(self, session_mgr, chain_state, peer_mgr, kind):
+    def __init__(self, session_mgr, chain_state, mempool, peer_mgr, kind):
         super().__init__(rpc_protocol=JSONRPCAutoDetect)
         self.logger = util.class_logger(__name__, self.__class__.__name__)
         self.session_mgr = session_mgr
         self.chain_state = chain_state
+        self.mempool = mempool
         self.peer_mgr = peer_mgr
         self.kind = kind  # 'RPC', 'TCP' etc.
-        self.env = chain_state.env
+        self.env = session_mgr.env
         self.coin = self.env.coin
         self.client = 'unknown'
         self.anon_logs = self.env.anon_logs
@@ -493,6 +493,9 @@ class SessionBase(ServerSession):
         self.log_me = False
         self.bw_limit = self.env.bandwidth_limit
         self._orig_mr = self.rpc.message_received
+
+    async def notify(self, height, touched):
+        pass
 
     def peer_address_str(self, *, for_log=True):
         '''Returns the peer's IP address and port as a human-readable
@@ -615,7 +618,7 @@ class ElectrumX(SessionBase):
     def sub_count(self):
         return len(self.hashX_subs)
 
-    async def notify_async(self, our_touched):
+    async def notify_touched(self, our_touched):
         changed = {}
 
         for hashX in our_touched:
@@ -645,7 +648,7 @@ class ElectrumX(SessionBase):
             self.logger.info('notified of {:,d} address{}'
                              .format(len(changed), es))
 
-    def notify(self, height, touched):
+    async def notify(self, height, touched):
         '''Notify the client about changes to touched addresses (from mempool
         updates or new blocks) and height.
 
@@ -662,11 +665,9 @@ class ElectrumX(SessionBase):
                 args = (self.subscribe_headers_result(height), )
                 self.send_notification('blockchain.headers.subscribe', args)
 
-        our_touched = touched.intersection(self.hashX_subs)
-        if our_touched or (height_changed and self.mempool_statuses):
-            return our_touched
-
-        return None
+        touched = touched.intersection(self.hashX_subs)
+        if touched or (height_changed and self.mempool_statuses):
+            await self.notify_touched(touched)
 
     def assert_boolean(self, value):
         '''Return param value it is boolean otherwise raise an RPCError.'''
@@ -728,7 +729,7 @@ class ElectrumX(SessionBase):
         # Note history is ordered and mempool unordered in electrum-server
         # For mempool, height is -1 if unconfirmed txins, otherwise 0
         history = await self.chain_state.get_history(hashX)
-        mempool = await self.chain_state.mempool_transactions(hashX)
+        mempool = await self.mempool.transaction_summaries(hashX)
 
         status = ''.join('{}:{:d}:'.format(hash_to_hex_str(tx_hash), height)
                          for tx_hash, height in history)
@@ -751,8 +752,8 @@ class ElectrumX(SessionBase):
         effects.'''
         utxos = await self.chain_state.get_utxos(hashX)
         utxos = sorted(utxos)
-        utxos.extend(self.chain_state.mempool_get_utxos(hashX))
-        spends = await self.chain_state.mempool_potential_spends(hashX)
+        utxos.extend(await self.mempool.unordered_UTXOs(hashX))
+        spends = await self.mempool.potential_spends(hashX)
 
         return [{'tx_hash': hash_to_hex_str(utxo.tx_hash),
                  'tx_pos': utxo.tx_pos,
@@ -808,7 +809,7 @@ class ElectrumX(SessionBase):
     async def get_balance(self, hashX):
         utxos = await self.chain_state.get_utxos(hashX)
         confirmed = sum(utxo.value for utxo in utxos)
-        unconfirmed = self.chain_state.mempool_value(hashX)
+        unconfirmed = await self.mempool.balance_delta(hashX)
         return {'confirmed': confirmed, 'unconfirmed': unconfirmed}
 
     async def scripthash_get_balance(self, scripthash):
@@ -819,7 +820,7 @@ class ElectrumX(SessionBase):
     async def unconfirmed_history(self, hashX):
         # Note unconfirmed history is unordered in electrum-server
         # Height is -1 if unconfirmed txins, otherwise 0
-        mempool = await self.chain_state.mempool_transactions(hashX)
+        mempool = await self.mempool.transaction_summaries(hashX)
         return [{'tx_hash': tx_hash, 'height': -unconfirmed, 'fee': fee}
                 for tx_hash, fee, unconfirmed in mempool]
 
@@ -972,10 +973,6 @@ class ElectrumX(SessionBase):
                 banner = await self.replaced_banner(banner)
 
         return banner
-
-    def mempool_get_fee_histogram(self):
-        '''Memory pool fee histogram.'''
-        return self.chain_state.mempool_fee_histogram()
 
     async def relayfee(self):
         '''The minimum fee a low-priority tx must pay in order to be accepted
@@ -1151,7 +1148,8 @@ class ElectrumX(SessionBase):
         if ptuple >= (1, 2):
             # New handler as of 1.2
             handlers.update({
-                'mempool.get_fee_histogram': self.mempool_get_fee_histogram,
+                'mempool.get_fee_histogram':
+                self.mempool.compact_fee_histogram,
                 'blockchain.block.headers': self.block_headers_12,
                 'server.ping': self.ping,
             })
@@ -1218,20 +1216,14 @@ class DashElectrumX(ElectrumX):
             'masternode.list': self.masternode_list
         })
 
-    async def notify_masternodes_async(self):
+    async def notify(self, height, touched):
+        '''Notify the client about changes in masternode list.'''
+        await super().notify(height, touched)
         for mn in self.mns:
             status = await self.daemon_request('masternode_list',
                                                ['status', mn])
             self.send_notification('masternode.subscribe',
                                    [mn, status.get(mn)])
-
-    def notify(self, height, touched):
-        '''Notify the client about changes in masternode list.'''
-        result = super().notify(height, touched)
-        # FIXME: the notifications should be done synchronously and the
-        # master node list fetched once asynchronously
-        self.session_mgr.tasks.create_task(self.notify_masternodes_async())
-        return result
 
     # Masternode command handlers
     async def masternode_announce_broadcast(self, signmnb):

@@ -23,12 +23,17 @@ from electrumx.lib.util import chunks, formatted_time, class_logger
 import electrumx.server.db
 
 
+RAW_BLOCKS, PREFETCHER_CAUGHT_UP, REORG_CHAIN = range(3)
+
+
 class Prefetcher(object):
     '''Prefetches blocks (in the forward direction only).'''
 
-    def __init__(self, bp):
+    def __init__(self, daemon, coin, queue):
         self.logger = class_logger(__name__, self.__class__.__name__)
-        self.bp = bp
+        self.daemon = daemon
+        self.coin = coin
+        self.queue = queue
         self.caught_up = False
         # Access to fetched_height should be protected by the semaphore
         self.fetched_height = None
@@ -58,18 +63,19 @@ class Prefetcher(object):
         if self.cache_size < self.min_cache_size:
             self.refill_event.set()
 
-    async def reset_height(self):
+    async def reset_height(self, height):
         '''Reset to prefetch blocks from the block processor's height.
 
         Used in blockchain reorganisations.  This coroutine can be
-        called asynchronously to the _prefetch coroutine so we must
-        synchronize with a semaphore.'''
+        called asynchronously to the _prefetch_blocks coroutine so we
+        must synchronize with a semaphore.
+        '''
         async with self.semaphore:
-            self.fetched_height = self.bp.height
+            self.fetched_height = height
             self.refill_event.set()
 
-        daemon_height = await self.bp.daemon.height()
-        behind = daemon_height - self.bp.height
+        daemon_height = await self.daemon.height()
+        behind = daemon_height - height
         if behind > 0:
             self.logger.info('catching up to daemon height {:,d} '
                              '({:,d} blocks behind)'
@@ -83,8 +89,8 @@ class Prefetcher(object):
 
         Repeats until the queue is full or caught up.
         '''
-        daemon = self.bp.daemon
-        daemon_height = await daemon.height(self.bp.caught_up_event.is_set())
+        daemon = self.daemon
+        daemon_height = await daemon.height()
         async with self.semaphore:
             while self.cache_size < self.min_cache_size:
                 # Try and catch up all blocks but limit to room in cache.
@@ -96,7 +102,7 @@ class Prefetcher(object):
                 if not count:
                     if not self.caught_up:
                         self.caught_up = True
-                        self.bp.on_prefetcher_first_caught_up()
+                        await self.queue.put((PREFETCHER_CAUGHT_UP, ))
                     return False
 
                 first = self.fetched_height + 1
@@ -110,7 +116,7 @@ class Prefetcher(object):
 
                 # Special handling for genesis block
                 if first == 0:
-                    blocks[0] = self.bp.coin.genesis_block(blocks[0])
+                    blocks[0] = self.coin.genesis_block(blocks[0])
                     self.logger.info('verified genesis block with hash {}'
                                      .format(hex_hashes[0]))
 
@@ -121,7 +127,7 @@ class Prefetcher(object):
                 else:
                     self.ave_size = (size + (10 - count) * self.ave_size) // 10
 
-                self.bp.on_prefetched_blocks(blocks, first)
+                await self.queue.put((RAW_BLOCKS, blocks, first))
                 self.cache_size += size
                 self.fetched_height += count
 
@@ -146,33 +152,23 @@ class BlockProcessor(electrumx.server.db.DB):
     Coordinate backing up in case of chain reorganisations.
     '''
 
-    def __init__(self, env, tasks, daemon):
+    def __init__(self, env, tasks, daemon, notifications):
         super().__init__(env)
-
-        # An incomplete compaction needs to be cancelled otherwise
-        # restarting it will corrupt the history
-        self.history.cancel_compaction()
 
         self.tasks = tasks
         self.daemon = daemon
+        self.notifications = notifications
 
-        # These are our state as we move ahead of DB state
-        self.fs_height = self.db_height
-        self.fs_tx_count = self.db_tx_count
-        self.height = self.db_height
-        self.tip = self.db_tip
-        self.tx_count = self.db_tx_count
-
-        self.caught_up_event = asyncio.Event()
-        self.task_queue = asyncio.Queue()
+        # Work queue
+        self.queue = asyncio.Queue()
+        self._caught_up_event = asyncio.Event()
+        self.prefetcher = Prefetcher(daemon, env.coin, self.queue)
 
         # Meta
         self.cache_MB = env.cache_MB
         self.next_cache_check = 0
         self.last_flush = time.time()
-        self.last_flush_tx_count = self.tx_count
         self.touched = set()
-        self.callbacks = []
 
         # Header merkle cache
         self.merkle = Merkle()
@@ -187,23 +183,10 @@ class BlockProcessor(electrumx.server.db.DB):
         self.utxo_cache = {}
         self.db_deletes = []
 
-        self.prefetcher = Prefetcher(self)
-
-        if self.utxo_db.for_sync:
-            self.logger.info('flushing DB cache at {:,d} MB'
-                             .format(self.cache_MB))
-
-    def add_task(self, task):
-        '''Add the task to our task queue.'''
-        self.task_queue.put_nowait(task)
-
-    def on_prefetched_blocks(self, blocks, first):
-        '''Called by the prefetcher when it has prefetched some blocks.'''
-        self.add_task(partial(self.check_and_advance_blocks, blocks, first))
-
-    def on_prefetcher_first_caught_up(self):
-        '''Called by the prefetcher when it first catches up.'''
-        self.add_task(self.first_caught_up)
+        # If the lock is successfully acquired, in-memory chain state
+        # is consistent with self.height
+        self.state_lock = asyncio.Lock()
+        self.worker_task = None
 
     def add_new_block_callback(self, callback):
         '''Add a function called when a new block is found.
@@ -213,41 +196,6 @@ class BlockProcessor(electrumx.server.db.DB):
         block(s), which is cleared on return.
         '''
         self.callbacks.append(callback)
-
-    async def main_loop(self):
-        '''Main loop for block processing.'''
-        self.tasks.create_task(self.prefetcher.main_loop())
-        await self.prefetcher.reset_height()
-
-        while True:
-            task = await self.task_queue.get()
-            await task()
-
-    def shutdown(self, executor):
-        '''Shutdown cleanly and flush to disk.'''
-        # First stut down the executor; it may be processing a block.
-        # Then we can flush anything remaining to disk.
-        executor.shutdown()
-        if self.height != self.db_height:
-            self.logger.info('flushing state to DB for a clean shutdown...')
-            self.flush(True)
-
-    async def first_caught_up(self):
-        '''Called when first caught up to daemon after starting.'''
-        # Flush everything with updated first_sync->False state.
-        self.first_sync = False
-        await self.tasks.run_in_thread(self.flush, True)
-        if self.utxo_db.for_sync:
-            self.logger.info(f'{electrumx.version} synced to '
-                             f'height {self.height:,d}')
-        self.open_dbs()
-        self.logger.info(f'caught up to height {self.height:,d}')
-        length = max(1, self.height - self.env.reorg_limit)
-        self.header_mc = MerkleCache(self.merkle, HeaderSource(self), length)
-        self.logger.info('populated header merkle cache')
-
-        # Reorgs use header_mc so safest to set this after initializing it
-        self.caught_up_event.set()
 
     async def check_and_advance_blocks(self, raw_blocks, first):
         '''Process the list of raw blocks passed.  Detects and handles
@@ -271,15 +219,16 @@ class BlockProcessor(electrumx.server.db.DB):
 
         if hprevs == chain:
             start = time.time()
-            await self.tasks.run_in_thread(self.advance_blocks, blocks)
+            async with self.state_lock:
+                await self.tasks.run_in_thread(self.advance_blocks, blocks)
             if not self.first_sync:
                 s = '' if len(blocks) == 1 else 's'
                 self.logger.info('processed {:,d} block{} in {:.1f}s'
                                  .format(len(blocks), s,
                                          time.time() - start))
-                for callback in self.callbacks:
-                    callback(self.touched)
-            self.touched.clear()
+            if self._caught_up_event.is_set():
+                await self.notifications.on_block(self.touched, self.height)
+            self.touched = set()
         elif hprevs[0] != chain[0]:
             await self.reorg_chain()
         else:
@@ -290,17 +239,7 @@ class BlockProcessor(electrumx.server.db.DB):
             # just to reset the prefetcher and try again.
             self.logger.warning('daemon blocks do not form a chain; '
                                 'resetting the prefetcher')
-            await self.prefetcher.reset_height()
-
-    def force_chain_reorg(self, count):
-        '''Force a reorg of the given number of blocks.
-
-        Returns True if a reorg is queued, false if not caught up.
-        '''
-        if self.caught_up_event.is_set():
-            self.add_task(partial(self.reorg_chain, count=count))
-            return True
-        return False
+            await self.prefetcher.reset_height(self.height)
 
     async def reorg_chain(self, count=None):
         '''Handle a chain reorganisation.
@@ -328,11 +267,12 @@ class BlockProcessor(electrumx.server.db.DB):
         last = start + count - 1
         for hex_hashes in chunks(hashes, 50):
             raw_blocks = await get_raw_blocks(last, hex_hashes)
-            await self.tasks.run_in_thread(self.backup_blocks, raw_blocks)
+            async with self.state_lock:
+                await self.tasks.run_in_thread(self.backup_blocks, raw_blocks)
             last -= len(raw_blocks)
         # Truncate header_mc: header count is 1 more than the height
         self.header_mc.truncate(self.height + 1)
-        await self.prefetcher.reset_height()
+        await self.prefetcher.reset_height(self.height)
 
     async def reorg_hashes(self, count):
         '''Return a pair (start, hashes) of blocks to back up during a
@@ -550,7 +490,7 @@ class BlockProcessor(electrumx.server.db.DB):
 
         # If caught up, flush everything as client queries are
         # performed on the DB.
-        if self.caught_up_event.is_set():
+        if self._caught_up_event.is_set():
             self.flush(True)
         else:
             if time.time() > self.next_cache_check:
@@ -808,3 +748,90 @@ class BlockProcessor(electrumx.server.db.DB):
         self.db_tx_count = self.tx_count
         self.db_height = self.height
         self.db_tip = self.tip
+
+    async def _process_queue(self):
+        '''Loop forever processing enqueued work.'''
+        while True:
+            work, *args = await self.queue.get()
+            if work == RAW_BLOCKS:
+                raw_blocks, first = args
+                await self.check_and_advance_blocks(raw_blocks, first)
+            elif work == PREFETCHER_CAUGHT_UP:
+                self._caught_up_event.set()
+                # Initialise the notification framework
+                await self.notifications.on_block(set(), self.height)
+            elif work == REORG_CHAIN:
+                count, = args
+                await self.reorg_chain(count)
+
+    def _on_dbs_opened(self):
+        # An incomplete compaction needs to be cancelled otherwise
+        # restarting it will corrupt the history
+        self.history.cancel_compaction()
+        # These are our state as we move ahead of DB state
+        self.fs_height = self.db_height
+        self.fs_tx_count = self.db_tx_count
+        self.height = self.db_height
+        self.tip = self.db_tip
+        self.tx_count = self.db_tx_count
+        self.last_flush_tx_count = self.tx_count
+        if self.utxo_db.for_sync:
+            self.logger.info(f'flushing DB cache at {self.cache_MB:,d} MB')
+
+    # --- External API
+
+    async def catch_up_to_daemon(self):
+        '''Process and index blocks until we catch up with the daemon.
+
+        Returns once caught up.  Future blocks continue to be
+        processed in a separate task.
+        '''
+        # Open the databases first.
+        await self.open_for_sync()
+        self._on_dbs_opened()
+        # Get the prefetcher running
+        self.tasks.create_task(self.prefetcher.main_loop())
+        await self.prefetcher.reset_height(self.height)
+        # Start our loop that processes blocks as they are fetched
+        self.worker_task = self.tasks.create_task(self._process_queue())
+        # Wait until caught up
+        await self._caught_up_event.wait()
+        # Flush everything but with first_sync->False state.
+        first_sync = self.first_sync
+        self.first_sync = False
+        self.flush(True)
+        if first_sync:
+            self.logger.info(f'{electrumx.version} synced to '
+                             f'height {self.height:,d}')
+        # Reopen for serving
+        await self.open_for_serving()
+
+        # Populate the header merkle cache
+        length = max(1, self.height - self.env.reorg_limit)
+        self.header_mc = MerkleCache(self.merkle, HeaderSource(self), length)
+        self.logger.info('populated header merkle cache')
+
+    def force_chain_reorg(self, count):
+        '''Force a reorg of the given number of blocks.
+
+        Returns True if a reorg is queued, false if not caught up.
+        '''
+        if self._caught_up_event.is_set():
+            self.queue.put_nowait((REORG_CHAIN, count))
+            return True
+        return False
+
+    async def shutdown(self):
+        '''Shutdown cleanly and flush to disk.
+
+        If during initial sync ElectrumX is asked to shut down when a
+        large number of blocks have been processed but not written to
+        disk, it should write those to disk before exiting, as
+        otherwise a significant amount of work could be lost.
+        '''
+        if self.worker_task:
+            async with self.state_lock:
+                # Shut down block processing
+                self.worker_task.cancel()
+                self.logger.info('flushing to DB for a clean shutdown...')
+                self.flush(True)

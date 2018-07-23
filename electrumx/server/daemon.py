@@ -40,21 +40,12 @@ class Daemon(object):
         self.coin = env.coin
         self.set_urls(env.coin.daemon_urls(env.daemon_url))
         self._height = None
-        self._mempool_hashes = set()
-        self.mempool_refresh_event = asyncio.Event()
         # Limit concurrent RPC calls to this number.
         # See DEFAULT_HTTP_WORKQUEUE in bitcoind, which is typically 16
         self.workqueue_semaphore = asyncio.Semaphore(value=10)
         self.down = False
         self.last_error_time = 0
         self.req_id = 0
-        # assignment of asyncio.TimeoutError are essentially ignored
-        if aiohttp.__version__.startswith('1.'):
-            self.ClientHttpProcessingError = aiohttp.ClientHttpProcessingError
-            self.ClientPayloadError = asyncio.TimeoutError
-        else:
-            self.ClientHttpProcessingError = asyncio.TimeoutError
-            self.ClientPayloadError = aiohttp.ClientPayloadError
         self._available_rpcs = {}  # caches results for _is_rpc_available()
 
     def next_req_id(self):
@@ -140,9 +131,7 @@ class Daemon(object):
                 log_error('timeout error.')
             except aiohttp.ServerDisconnectedError:
                 log_error('disconnected.')
-            except self.ClientHttpProcessingError:
-                log_error('HTTP error.')
-            except self.ClientPayloadError:
+            except aiohttp.ClientPayloadError:
                 log_error('payload encoding error.')
             except aiohttp.ClientConnectionError:
                 log_error('connection problem - is your daemon running?')
@@ -281,17 +270,10 @@ class Daemon(object):
         '''Broadcast a transaction to the network.'''
         return await self._send_single('sendrawtransaction', params)
 
-    async def height(self, mempool=False):
+    async def height(self):
         '''Query the daemon for its current height.'''
         self._height = await self._send_single('getblockcount')
-        if mempool:
-            self._mempool_hashes = set(await self.mempool_hashes())
-            self.mempool_refresh_event.set()
         return self._height
-
-    def cached_mempool_hashes(self):
-        '''Return the cached mempool hashes.'''
-        return self._mempool_hashes
 
     def cached_height(self):
         '''Return the cached daemon height.

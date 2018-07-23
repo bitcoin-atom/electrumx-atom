@@ -1,4 +1,4 @@
-# Copyright (c) 2016, Neil Booth
+# Copyright (c) 2016-2018, Neil Booth
 #
 # All rights reserved.
 #
@@ -12,10 +12,20 @@ import itertools
 import time
 from collections import defaultdict
 
+import attr
+
 from electrumx.lib.hash import hash_to_hex_str, hex_str_to_hash
 from electrumx.lib.util import class_logger
-from electrumx.server.daemon import DaemonError
-from electrumx.server.db import UTXO, DB
+from electrumx.server.db import UTXO
+
+
+@attr.s(slots=True)
+class MemPoolTx(object):
+    hash = attr.ib()
+    in_pairs = attr.ib()
+    out_pairs = attr.ib()
+    fee = attr.ib()
+    size = attr.ib()
 
 
 class MemPool(object):
@@ -26,28 +36,88 @@ class MemPool(object):
 
     To that end we maintain the following maps:
 
-       tx_hash -> (txin_pairs, txout_pairs, tx_fee, tx_size)
+       tx_hash -> MemPoolTx
        hashX   -> set of all tx hashes in which the hashX appears
 
     A pair is a (hashX, value) tuple.  tx hashes are hex strings.
     '''
 
-    def __init__(self, coin, chain_state, tasks, add_new_block_callback):
+    def __init__(self, coin, tasks, daemon, notifications, lookup_utxos):
         self.logger = class_logger(__name__, self.__class__.__name__)
         self.coin = coin
-        self.chain_state = chain_state
+        self.lookup_utxos = lookup_utxos
         self.tasks = tasks
-        self.touched = set()
-        self.stop = False
+        self.daemon = daemon
+        self.notifications = notifications
         self.txs = {}
         self.hashXs = defaultdict(set)  # None can be a key
-        self.synchronized_event = asyncio.Event()
         self.fee_histogram = defaultdict(int)
-        self.compact_fee_histogram = []
+        self.cached_compact_histogram = []
         self.histogram_time = 0
-        add_new_block_callback(self.on_new_block)
 
-    def _resync_daemon_hashes(self, unprocessed, unfetched):
+    async def _log_stats(self):
+        while True:
+            self.logger.info(f'{len(self.txs):,d} txs '
+                             f'touching {len(self.hashXs):,d} addresses')
+            await asyncio.sleep(120)
+
+    async def _synchronize_forever(self):
+        while True:
+            await asyncio.sleep(5)
+            await self._synchronize(False)
+
+    async def _refresh_hashes(self):
+        '''Return a (hash set, height) pair when we're sure which height they
+        are for.'''
+        while True:
+            height = self.daemon.cached_height()
+            hashes = await self.daemon.mempool_hashes()
+            if height == await self.daemon.height():
+                return set(hashes), height
+
+    async def _synchronize(self, first_time):
+        '''Asynchronously maintain mempool status with daemon.
+
+        Processes the mempool each time the mempool refresh event is
+        signalled.
+        '''
+        unprocessed = {}
+        unfetched = set()
+        touched = set()
+        txs = self.txs
+        next_refresh = 0
+        fetch_size = 800
+        process_some = self._async_process_some(fetch_size // 2)
+
+        while True:
+            now = time.time()
+            # If processing a large mempool, a block being found might
+            # shrink our work considerably, so refresh our view every 20s
+            if now > next_refresh:
+                hashes, height = await self._refresh_hashes()
+                self._resync_hashes(hashes, unprocessed, unfetched, touched)
+                next_refresh = time.time() + 20
+
+            # Log progress of initial sync
+            todo = len(unfetched) + len(unprocessed)
+            if first_time:
+                pct = (len(txs) - todo) * 100 // len(txs) if txs else 0
+                self.logger.info(f'catchup {pct:d}% complete '
+                                 f'({todo:,d} txs left)')
+            if not todo:
+                break
+
+            # FIXME: parallelize
+            if unfetched:
+                count = min(len(unfetched), fetch_size)
+                hex_hashes = [unfetched.pop() for n in range(count)]
+                unprocessed.update(await self._fetch_raw_txs(hex_hashes))
+            if unprocessed:
+                await process_some(unprocessed, touched)
+
+        await self.notifications.on_mempool(touched, height)
+
+    def _resync_hashes(self, hashes, unprocessed, unfetched, touched):
         '''Re-sync self.txs with the list of hashes in the daemon's mempool.
 
         Additionally, remove gone hashes from unprocessed and
@@ -55,23 +125,19 @@ class MemPool(object):
         '''
         txs = self.txs
         hashXs = self.hashXs
-        touched = self.touched
         fee_hist = self.fee_histogram
-
-        hashes = self.chain_state.cached_mempool_hashes()
         gone = set(txs).difference(hashes)
         for hex_hash in gone:
             unfetched.discard(hex_hash)
             unprocessed.pop(hex_hash, None)
-            item = txs.pop(hex_hash)
-            if item:
-                txin_pairs, txout_pairs, tx_fee, tx_size = item
-                fee_rate = tx_fee // tx_size
-                fee_hist[fee_rate] -= tx_size
+            tx = txs.pop(hex_hash)
+            if tx:
+                fee_rate = tx.fee // tx.size
+                fee_hist[fee_rate] -= tx.size
                 if fee_hist[fee_rate] == 0:
                     fee_hist.pop(fee_rate)
-                tx_hashXs = set(hashX for hashX, value in txin_pairs)
-                tx_hashXs.update(hashX for hashX, value in txout_pairs)
+                tx_hashXs = set(hashX for hashX, value in tx.in_pairs)
+                tx_hashXs.update(hashX for hashX, value in tx.out_pairs)
                 for hashX in tx_hashXs:
                     hashXs[hashX].remove(hex_hash)
                     if not hashXs[hashX]:
@@ -83,73 +149,11 @@ class MemPool(object):
         for hex_hash in new:
             txs[hex_hash] = None
 
-    async def main_loop(self):
-        '''Asynchronously maintain mempool status with daemon.
-
-        Processes the mempool each time the daemon's mempool refresh
-        event is signalled.
-        '''
-        unprocessed = {}
-        unfetched = set()
-        txs = self.txs
-        fetch_size = 800
-        process_some = self._async_process_some(fetch_size // 2)
-
-        self.logger.info('beginning processing of daemon mempool.  '
-                         'This can take some time...')
-        await self.chain_state.mempool_refresh_event.wait()
-        next_log = 0
-        loops = -1  # Zero during initial catchup
-
-        while True:
-            # Avoid double notifications if processing a block
-            if self.touched and not self.chain_state.processing_new_block():
-                self.notify_sessions(self.touched)
-                self.touched.clear()
-
-            # Log progress / state
-            todo = len(unfetched) + len(unprocessed)
-            if loops == 0:
-                pct = (len(txs) - todo) * 100 // len(txs) if txs else 0
-                self.logger.info('catchup {:d}% complete '
-                                 '({:,d} txs left)'.format(pct, todo))
-            if not todo:
-                loops += 1
-                if loops > 0:
-                    self.synchronized_event.set()
-                now = time.time()
-                if now >= next_log and loops:
-                    self.logger.info('{:,d} txs touching {:,d} addresses'
-                                     .format(len(txs), len(self.hashXs)))
-                    next_log = now + 150
-
-            try:
-                if not todo:
-                    await self.chain_state.mempool_refresh_event.wait()
-
-                self._resync_daemon_hashes(unprocessed, unfetched)
-                self.chain_state.mempool_refresh_event.clear()
-
-                if unfetched:
-                    count = min(len(unfetched), fetch_size)
-                    hex_hashes = [unfetched.pop() for n in range(count)]
-                    unprocessed.update(await self.fetch_raw_txs(hex_hashes))
-
-                if unprocessed:
-                    await process_some(unprocessed)
-            except DaemonError as e:
-                self.logger.info('ignoring daemon error: {}'.format(e))
-            except asyncio.CancelledError:
-                # This aids clean shutdowns
-                self.stop = True
-                break
-
     def _async_process_some(self, limit):
         pending = []
         txs = self.txs
-        fee_hist = self.fee_histogram
 
-        async def process(unprocessed):
+        async def process(unprocessed, touched):
             nonlocal pending
 
             raw_txs = {}
@@ -164,119 +168,96 @@ class MemPool(object):
                 deferred = pending
                 pending = []
 
-            result, deferred = await self.tasks.run_in_thread(
-                self.process_raw_txs, raw_txs, deferred)
-
+            deferred = await self._process_raw_txs(raw_txs, deferred, touched)
             pending.extend(deferred)
-            hashXs = self.hashXs
-            touched = self.touched
-            for hex_hash, item in result.items():
-                if hex_hash in txs:
-                    txs[hex_hash] = item
-                    txin_pairs, txout_pairs, tx_fee, tx_size = item
-                    fee_rate = tx_fee // tx_size
-                    fee_hist[fee_rate] += tx_size
-                    for hashX, value in itertools.chain(txin_pairs,
-                                                        txout_pairs):
-                        touched.add(hashX)
-                        hashXs[hashX].add(hex_hash)
 
         return process
 
-    def on_new_block(self, touched):
-        '''Called after processing one or more new blocks.
-
-        Touched is a set of hashXs touched by the transactions in the
-        block.  Caller must be aware it is modified by this function.
-        '''
-        # Minor race condition here with mempool processor thread
-        touched.update(self.touched)
-        self.touched.clear()
-        self.notify_sessions(touched)
-
-    async def fetch_raw_txs(self, hex_hashes):
+    async def _fetch_raw_txs(self, hex_hashes):
         '''Fetch a list of mempool transactions.'''
-        raw_txs = await self.chain_state.getrawtransactions(hex_hashes)
+        raw_txs = await self.daemon.getrawtransactions(hex_hashes)
 
         # Skip hashes the daemon has dropped.  Either they were
         # evicted or they got in a block.
         return {hh: raw for hh, raw in zip(hex_hashes, raw_txs) if raw}
 
-    def process_raw_txs(self, raw_tx_map, pending):
+    async def _process_raw_txs(self, raw_tx_map, pending, touched):
         '''Process the dictionary of raw transactions and return a dictionary
         of updates to apply to self.txs.
-
-        This runs in the executor so should not update any member
-        variables it doesn't own.  Atomic reads of self.txs that do
-        not depend on the result remaining the same are fine.
         '''
-        script_hashX = self.coin.hashX_from_script
-        deserializer = self.coin.DESERIALIZER
+        def deserialize_txs():
+            script_hashX = self.coin.hashX_from_script
+            deserializer = self.coin.DESERIALIZER
+
+            # Deserialize each tx and put it in a pending list
+            for tx_hash, raw_tx in raw_tx_map.items():
+                tx, tx_size = deserializer(raw_tx).read_tx_and_vsize()
+
+                # Convert the tx outputs into (hashX, value) pairs
+                txout_pairs = [(script_hashX(txout.pk_script), txout.value)
+                               for txout in tx.outputs]
+
+                # Convert the tx inputs to ([prev_hex_hash, prev_idx) pairs
+                txin_pairs = [(hash_to_hex_str(txin.prev_hash), txin.prev_idx)
+                              for txin in tx.inputs]
+
+                pending.append(MemPoolTx(tx_hash, txin_pairs, txout_pairs,
+                                         0, tx_size))
+
+        # Do this potentially slow operation in a thread so as not to
+        # block
+        await self.tasks.run_in_thread(deserialize_txs)
+
+        # The transaction inputs can be from other mempool
+        # transactions (which may or may not be processed yet) or are
+        # otherwise presumably in the DB.
         txs = self.txs
+        db_prevouts = [(hex_str_to_hash(prev_hash), prev_idx)
+                       for tx in pending
+                       for (prev_hash, prev_idx) in tx.in_pairs
+                       if prev_hash not in txs]
 
-        # Deserialize each tx and put it in a pending list
-        for tx_hash, raw_tx in raw_tx_map.items():
-            if tx_hash not in txs:
-                continue
-            tx, tx_size = deserializer(raw_tx).read_tx_and_vsize()
+        # If a lookup fails, it returns a None entry
+        db_utxos = await self.lookup_utxos(db_prevouts)
+        db_utxo_map = {(hash_to_hex_str(prev_hash), prev_idx): db_utxo
+                       for (prev_hash, prev_idx), db_utxo
+                       in zip(db_prevouts, db_utxos)}
 
-            # Convert the tx outputs into (hashX, value) pairs
-            txout_pairs = [(script_hashX(txout.pk_script), txout.value)
-                           for txout in tx.outputs]
-
-            # Convert the tx inputs to ([prev_hex_hash, prev_idx) pairs
-            txin_pairs = [(hash_to_hex_str(txin.prev_hash), txin.prev_idx)
-                          for txin in tx.inputs]
-
-            pending.append((tx_hash, txin_pairs, txout_pairs, tx_size))
-
-        # Now process what we can
-        result = {}
         deferred = []
-        utxo_lookup = self.chain_state.utxo_lookup
+        hashXs = self.hashXs
+        fee_hist = self.fee_histogram
 
-        for item in pending:
-            if self.stop:
-                break
-
-            tx_hash, old_txin_pairs, txout_pairs, tx_size = item
-            if tx_hash not in txs:
+        for tx in pending:
+            if tx.hash not in txs:
                 continue
 
-            mempool_missing = False
-            txin_pairs = []
-
+            in_pairs = []
             try:
-                for prev_hex_hash, prev_idx in old_txin_pairs:
-                    tx_info = txs.get(prev_hex_hash, 0)
-                    if tx_info is None:
-                        tx_info = result.get(prev_hex_hash)
-                        if not tx_info:
-                            mempool_missing = True
-                            continue
-                    if tx_info:
-                        txin_pairs.append(tx_info[1][prev_idx])
-                    elif not mempool_missing:
-                        prev_hash = hex_str_to_hash(prev_hex_hash)
-                        txin_pairs.append(utxo_lookup(prev_hash, prev_idx))
-            except (DB.MissingUTXOError, DB.DBError):
-                # DBError can happen when flushing a newly processed
-                # block.  MissingUTXOError typically happens just
-                # after the daemon has accepted a new block and the
-                # new mempool has deps on new txs in that block.
+                for previn in tx.in_pairs:
+                    utxo = db_utxo_map.get(previn)
+                    if not utxo:
+                        prev_hash, prev_index = previn
+                        # This can raise a KeyError or TypeError
+                        utxo = txs[prev_hash][1][prev_index]
+                    in_pairs.append(utxo)
+            except (KeyError, TypeError):
+                deferred.append(tx)
                 continue
 
-            if mempool_missing:
-                deferred.append(item)
-            else:
-                # Compute fee
-                tx_fee = (sum(v for hashX, v in txin_pairs) -
-                          sum(v for hashX, v in txout_pairs))
-                result[tx_hash] = (txin_pairs, txout_pairs, tx_fee, tx_size)
+            tx.in_pairs = in_pairs
+            # Compute fee
+            tx_fee = (sum(v for hashX, v in tx.in_pairs) -
+                      sum(v for hashX, v in tx.out_pairs))
+            fee_rate = tx.fee // tx.size
+            fee_hist[fee_rate] += tx.size
+            txs[tx.hash] = tx
+            for hashX, value in itertools.chain(tx.in_pairs, tx.out_pairs):
+                touched.add(hashX)
+                hashXs[hashX].add(tx.hash)
 
-        return result, deferred
+        return deferred
 
-    async def raw_transactions(self, hashX):
+    async def _raw_transactions(self, hashX):
         '''Returns an iterable of (hex_hash, raw_tx) pairs for all
         transactions in the mempool that touch hashX.
 
@@ -287,49 +268,63 @@ class MemPool(object):
             return []
 
         hex_hashes = self.hashXs[hashX]
-        raw_txs = await self.chain_state.getrawtransactions(hex_hashes)
+        raw_txs = await self.daemon.getrawtransactions(hex_hashes)
         return zip(hex_hashes, raw_txs)
 
-    async def transactions(self, hashX):
-        '''Generate (hex_hash, tx_fee, unconfirmed) tuples for mempool
-        entries for the hashX.
+    def _calc_compact_histogram(self):
+        # For efficiency, get_fees returns a compact histogram with
+        # variable bin size.  The compact histogram is an array of
+        # (fee, vsize) values.  vsize_n is the cumulative virtual size
+        # of mempool transactions with a fee rate in the interval
+        # [fee_(n-1), fee_n)], and fee_(n-1) > fee_n. Fee intervals
+        # are chosen so as to create tranches that contain at least
+        # 100kb of transactions
+        out = []
+        size = 0
+        r = 0
+        binsize = 100000
+        for fee, s in sorted(self.fee_histogram.items(), reverse=True):
+            size += s
+            if size + r > binsize:
+                out.append((fee, size))
+                r += size - binsize
+                size = 0
+                binsize *= 1.1
+        return out
 
-        unconfirmed is True if any txin is unconfirmed.
+    # External interface
+    async def start_and_wait_for_sync(self):
+        '''Starts the mempool synchronizer.
+
+        Waits for an initial synchronization before returning.
         '''
-        deserializer = self.coin.DESERIALIZER
-        pairs = await self.raw_transactions(hashX)
-        result = []
-        for hex_hash, raw_tx in pairs:
-            item = self.txs.get(hex_hash)
-            if not item or not raw_tx:
-                continue
-            tx_fee = item[2]
-            tx = deserializer(raw_tx).read_tx()
-            unconfirmed = any(hash_to_hex_str(txin.prev_hash) in self.txs
-                              for txin in tx.inputs)
-            result.append((hex_hash, tx_fee, unconfirmed))
-        return result
+        self.logger.info('beginning processing of daemon mempool.  '
+                         'This can take some time...')
+        await self._synchronize(True)
+        self.tasks.create_task(self._log_stats())
+        self.tasks.create_task(self._synchronize_forever())
 
-    def get_utxos(self, hashX):
-        '''Return an unordered list of UTXO named tuples from mempool
-        transactions that pay to hashX.
+    async def balance_delta(self, hashX):
+        '''Return the unconfirmed amount in the mempool for hashX.
 
-        This does not consider if any other mempool transactions spend
-        the outputs.
+        Can be positive or negative.
         '''
-        utxos = []
-        # hashXs is a defaultdict, so use get() to query
-        for hex_hash in self.hashXs.get(hashX, []):
-            item = self.txs.get(hex_hash)
-            if not item:
-                continue
-            txout_pairs = item[1]
-            for pos, (hX, value) in enumerate(txout_pairs):
-                if hX == hashX:
-                    # Unfortunately UTXO holds a binary hash
-                    utxos.append(UTXO(-1, pos, hex_str_to_hash(hex_hash),
-                                      0, value))
-        return utxos
+        value = 0
+        # hashXs is a defaultdict
+        if hashX in self.hashXs:
+            for hex_hash in self.hashXs[hashX]:
+                tx = self.txs[hex_hash]
+                value -= sum(v for h168, v in tx.in_pairs if h168 == hashX)
+                value += sum(v for h168, v in tx.out_pairs if h168 == hashX)
+        return value
+
+    async def compact_fee_histogram(self):
+        '''Return a compact fee histogram of the current mempool.'''
+        now = time.time()
+        if now > self.histogram_time:
+            self.histogram_time = now + 30
+            self.cached_compact_histogram = self._calc_compact_histogram()
+        return self.cached_compact_histogram
 
     async def potential_spends(self, hashX):
         '''Return a set of (prev_hash, prev_idx) pairs from mempool
@@ -338,7 +333,7 @@ class MemPool(object):
         None, some or all of these may be spends of the hashX.
         '''
         deserializer = self.coin.DESERIALIZER
-        pairs = await self.raw_transactions(hashX)
+        pairs = await self._raw_transactions(hashX)
         result = set()
         for hex_hash, raw_tx in pairs:
             if not raw_tx:
@@ -348,45 +343,41 @@ class MemPool(object):
                 result.add((txin.prev_hash, txin.prev_idx))
         return result
 
-    def value(self, hashX):
-        '''Return the unconfirmed amount in the mempool for hashX.
+    async def transaction_summaries(self, hashX):
+        '''Return a list of (tx_hex_hash, tx_fee, unconfirmed) tuples for
+        mempool entries for the hashX.
 
-        Can be positive or negative.
+        unconfirmed is True if any txin is unconfirmed.
         '''
-        value = 0
-        # hashXs is a defaultdict
-        if hashX in self.hashXs:
-            for hex_hash in self.hashXs[hashX]:
-                txin_pairs, txout_pairs, tx_fee, tx_size = self.txs[hex_hash]
-                value -= sum(v for h168, v in txin_pairs if h168 == hashX)
-                value += sum(v for h168, v in txout_pairs if h168 == hashX)
-        return value
+        deserializer = self.coin.DESERIALIZER
+        pairs = await self._raw_transactions(hashX)
+        result = []
+        for hex_hash, raw_tx in pairs:
+            mempool_tx = self.txs.get(hex_hash)
+            if not mempool_tx or not raw_tx:
+                continue
+            tx = deserializer(raw_tx).read_tx()
+            unconfirmed = any(hash_to_hex_str(txin.prev_hash) in self.txs
+                              for txin in tx.inputs)
+            result.append((hex_hash, mempool_tx.fee, unconfirmed))
+        return result
 
-    def get_fee_histogram(self):
-        now = time.time()
-        if now > self.histogram_time + 30:
-            self.update_compact_histogram()
-            self.histogram_time = now
-        return self.compact_fee_histogram
+    async def unordered_UTXOs(self, hashX):
+        '''Return an unordered list of UTXO named tuples from mempool
+        transactions that pay to hashX.
 
-    def update_compact_histogram(self):
-        # For efficiency, get_fees returns a compact histogram with
-        # variable bin size.  The compact histogram is an array of
-        # (fee, vsize) values.  vsize_n is the cumulative virtual size
-        # of mempool transactions with a fee rate in the interval
-        # [fee_(n-1), fee_n)], and fee_(n-1) > fee_n. Fee intervals
-        # are chosen so as to create tranches that contain at least
-        # 100kb of transactions
-        items = list(reversed(sorted(self.fee_histogram.items())))
-        out = []
-        size = 0
-        r = 0
-        binsize = 100000
-        for fee, s in items:
-            size += s
-            if size + r > binsize:
-                out.append((fee, size))
-                r += size - binsize
-                size = 0
-                binsize *= 1.1
-        self.compact_fee_histogram = out
+        This does not consider if any other mempool transactions spend
+        the outputs.
+        '''
+        utxos = []
+        # hashXs is a defaultdict, so use get() to query
+        for hex_hash in self.hashXs.get(hashX, []):
+            tx = self.txs.get(hex_hash)
+            if not tx:
+                continue
+            for pos, (hX, value) in enumerate(tx.out_pairs):
+                if hX == hashX:
+                    # Unfortunately UTXO holds a binary hash
+                    utxos.append(UTXO(-1, pos, hex_str_to_hash(hex_hash),
+                                      0, value))
+        return utxos
