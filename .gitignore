@@ -8,4 +8,5 @@
 docs/_build
 /build
 /dist
-/electrumx.egg-info
+/electrumX.egg-info
+.vscode/

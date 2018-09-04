@@ -1591,9 +1591,14 @@ class BitcoinAtom(Coin):
     TX_PER_BLOCK = 10
     RPC_PORT = 7332
     REORG_LIMIT = 5000
-    PEER_DEFAULT_PORTS = {'t': '50001', 's': '50002'}
+    PEER_DEFAULT_PORTS = {'t': '50003', 's': '50004'}
     PEERS = [
-        'electrum-bca.und.vc s t',
+        'electrum.bitcoinatom.io s t',
+        'electrum.bitcoinatom.net s t',
+        'electrumx1.bitcoin-atom.org s t',
+        'electrumx2.bitcoin-atom.org s t',
+        'electrumx3.bitcoin-atom.org s t',
+        'electrumx4.bitcoin-atom.org s t'
     ]
 
     @classmethod
@@ -1629,9 +1634,11 @@ class BitcoinAtomTestnet(BitcoinAtom):
     TX_COUNT_HEIGHT = 1334108
     TX_PER_BLOCK = 3
     RPC_PORT = 17332
-    PEER_DEFAULT_PORTS = {'t': '51001', 's': '51002'}
+    PEER_DEFAULT_PORTS = {'t': '51003', 's': '51004'}
     PEERS = [
-        'electrum-tbca.und.vc s t',
+        'electrum-test.bitcoinatom.io s t',
+        'electrum-test.bitcoinatom.net s t',
+        'electrumx1-test.bitcoin-atom.org s t'
     ]
 
 
